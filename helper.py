@@ -1,10 +1,11 @@
+import ot
+import scipy
+import torch
+import numpy as np
+
+from tqdm import tqdm
 from typing import List
 from anndata import AnnData
-import numpy as np
-import scipy
-import ot
-from tqdm import tqdm
-import torch
 
 
 
@@ -187,6 +188,26 @@ def match_spots_using_spatial_heuristic(
         elif n2<n1: pi[[(i not in row_ind) for i in range(n1)], :] = 1/(n1*n2)
     return pi
 
+def kl_divergence(X, Y):
+    """
+    Returns pairwise KL divergence (over all pairs of samples) of two matrices X and Y.
+
+    Args:
+        X: np array with dim (n_samples by n_features)
+        Y: np array with dim (m_samples by n_features)
+
+    Returns:
+        D: np array with dim (n_samples by m_samples). Pairwise KL divergence matrix.
+    """
+    assert X.shape[1] == Y.shape[1], "X and Y do not have the same number of features."
+
+    X = X/X.sum(axis=1, keepdims=True)
+    Y = Y/Y.sum(axis=1, keepdims=True)
+    log_X = np.log(X)
+    log_Y = np.log(Y)
+    X_log_X = np.matrix([np.dot(X[i],log_X[i].T) for i in range(X.shape[0])])
+    D = X_log_X.T - np.dot(X,log_Y.T)
+    return np.asarray(D)
 
 def kl_divergence_backend(X, Y):
     """
@@ -375,6 +396,15 @@ def cosine_dist_calculator(sliceA, sliceB, sliceA_name, sliceB_name, filePath, u
         np.save(fileName, cosine_dist_gene_expr)
 
     return cosine_dist_gene_expr
+
+def pairwise_msd(A, B):
+    A = np.asarray(A)
+    B = np.asarray(B)
+
+    # A: (m, d), B: (n, d)
+    diff = A[:, np.newaxis, :] - B[np.newaxis, :, :]  # shape: (m, n, d)
+    msd = np.mean(diff ** 2, axis=2)  # shape: (m, n)
+    return msd
 
 ## Covert a sparse matrix into a dense np array
 to_dense_array = lambda X: X.toarray() if isinstance(X,scipy.sparse.csr.spmatrix) else np.array(X)
