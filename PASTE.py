@@ -1,14 +1,16 @@
-import os
-import ot
-import time
-import inspect
-import datetime
-import numpy as np
-
-from anndata import AnnData
-from sklearn.decomposition import NMF
 from typing import List, Tuple, Optional
+import numpy as np
+from anndata import AnnData
+import ot
+import datetime
+import time
+from tqdm import tqdm
+import inspect
+import torch
+import pandas as pd
 from .visualization import stack_slices_pairwise
+import os
+from sklearn.decomposition import NMF
 from .helper import get_neighborhood_distribution, jensenshannon_divergence_backend, intersect, kl_divergence_backend, to_dense_array, extract_data_matrix, cosine_dist_calculator, pairwise_msd
 
 def pairwise_align_incent(
@@ -851,11 +853,11 @@ def my_fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = Non
         armijo = True  # there is no closed form line-search with KL
 
     if armijo:
-        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
             return ot.optim.line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
     else:
         # we are using this line search
-        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
             return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=0., reg=1., nx=nx, **kwargs)
     
     module_path = inspect.getfile(ot)
@@ -935,11 +937,11 @@ def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init = None, loss_fun='square
         armijo = True  # there is no closed form line-search with KL
 
     if armijo:
-        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
             return ot.optim.line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
     else:
         # PASTE uses this line search
-        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
             return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=0., reg=1., nx=nx, **kwargs)
 
     if log:
@@ -954,7 +956,6 @@ def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init = None, loss_fun='square
 
     else:
         return ot.optim.cg(p, q, (1 - alpha) * M, alpha, f, df, G0, line_search, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
-
 
 def solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M, reg,
                             alpha_min=None, alpha_max=None, nx=None, **kwargs):
@@ -1021,4 +1022,3 @@ def solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M, reg,
     cost_G = cost_G + a * (alpha ** 2) + b * alpha
 
     return alpha, 1, cost_G
-
