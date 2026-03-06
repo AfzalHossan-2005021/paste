@@ -1,11 +1,11 @@
-import ot
-import scipy
-import torch
-import numpy as np
-
-from tqdm import tqdm
 from typing import List
 from anndata import AnnData
+import numpy as np
+import scipy
+import ot
+from tqdm import tqdm
+import torch
+
 
 
 def kl_divergence_corresponding_backend(X, Y):
