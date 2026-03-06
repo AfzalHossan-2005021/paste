@@ -852,7 +852,7 @@ def my_fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = Non
 
     if armijo:
         def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
-            return ot.optim.line_search_armijo(cost, G, deltaG, Mi, cost_G, df_G, nx=nx, **kwargs)
+            return ot.optim.line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
     else:
         # we are using this line search
         def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
@@ -935,11 +935,11 @@ def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init = None, loss_fun='square
         armijo = True  # there is no closed form line-search with KL
 
     if armijo:
-        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
             return ot.optim.line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
     else:
         # PASTE uses this line search
-        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
             return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=0., reg=1., nx=nx, **kwargs)
 
     if log:
