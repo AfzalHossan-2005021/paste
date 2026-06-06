@@ -6,25 +6,25 @@ from sklearn.decomposition import NMF
 from .helper import intersect, kl_divergence_backend, to_dense_array, extract_data_matrix
 
 def pairwise_align(
-    sliceA: AnnData, 
-    sliceB: AnnData, 
-    alpha: float = 0.1, 
-    dissimilarity: str ='kl', 
-    use_rep: Optional[str] = None, 
-    G_init = None, 
-    a_distribution = None, 
-    b_distribution = None, 
-    norm: bool = False, 
-    numItermax: int = 200, 
-    backend = ot.backend.NumpyBackend(), 
-    use_gpu: bool = False, 
-    return_obj: bool = False, 
-    verbose: bool = False, 
-    gpu_verbose: bool = True, 
+    sliceA: AnnData,
+    sliceB: AnnData,
+    alpha: float = 0.1,
+    dissimilarity: str ='kl',
+    use_rep: Optional[str] = None,
+    G_init = None,
+    a_distribution = None,
+    b_distribution = None,
+    norm: bool = False,
+    numItermax: int = 200,
+    backend = ot.backend.NumpyBackend(),
+    use_gpu: bool = False,
+    return_obj: bool = False,
+    verbose: bool = False,
+    gpu_verbose: bool = True,
     **kwargs) -> Tuple[np.ndarray, Optional[int]]:
     """
-    Calculates and returns optimal alignment of two slices. 
-    
+    Calculates and returns optimal alignment of two slices.
+
     Args:
         sliceA: Slice A to align.
         sliceB: Slice B to align.
@@ -41,37 +41,48 @@ def pairwise_align(
         return_obj: If ``True``, additionally returns objective function output of FGW-OT.
         verbose: If ``True``, FGW-OT is verbose.
         gpu_verbose: If ``True``, print whether gpu is being used to user.
-   
+
     Returns:
         - Alignment of spots.
 
         If ``return_obj = True``, additionally returns:
-        
+
         - Objective function output of FGW-OT.
     """
-    
-    # Determine if gpu or cpu is being used
+
+    # ------------------------------------------------------------------ #
+    # Step 1: Resolve compute device up front.                            #
+    # Every tensor created below is immediately placed on `device` so     #
+    # the GPU is utilised from the first allocation onward.               #
+    # ------------------------------------------------------------------ #
+    device = None  # None → CPU / non-Torch path
     if use_gpu:
         try:
             import torch
-        except:
-             print("We currently only have gpu support for Pytorch. Please install torch.")
-                
-        if isinstance(backend,ot.backend.TorchBackend):
-            if torch.cuda.is_available():
+            if not isinstance(backend, ot.backend.TorchBackend):
+                print("We currently only have gpu support for Pytorch, please set backend = ot.backend.TorchBackend(). Reverting to selected backend cpu.")
+                use_gpu = False
+            elif torch.cuda.is_available():
+                device = torch.device("cuda")
                 if gpu_verbose:
                     print("gpu is available, using gpu.")
             else:
                 if gpu_verbose:
                     print("gpu is not available, resorting to torch cpu.")
                 use_gpu = False
-        else:
-            print("We currently only have gpu support for Pytorch, please set backend = ot.backend.TorchBackend(). Reverting to selected backend cpu.")
+        except ImportError:
+            print("We currently only have gpu support for Pytorch. Please install torch.")
             use_gpu = False
     else:
         if gpu_verbose:
             print("Using selected backend cpu. If you want to use gpu, set use_gpu = True.")
-            
+
+    def _to_device(t):
+        """Move a Torch tensor to the resolved device (no-op for numpy arrays)."""
+        if device is not None and hasattr(t, "to"):
+            return t.to(device)
+        return t
+
     # subset for common genes
     common_genes = intersect(sliceA.var.index, sliceB.var.index)
     sliceA = sliceA[:, common_genes]
@@ -82,74 +93,64 @@ def pairwise_align(
         if not len(s):
             raise ValueError(f"Found empty `AnnData`:\n{sliceA}.")
 
-    
     # Backend
-    nx = backend    
-    
+    nx = backend
+
     # Calculate spatial distances
     coordinatesA = sliceA.obsm['spatial'].copy()
     coordinatesA = nx.from_numpy(coordinatesA)
     coordinatesB = sliceB.obsm['spatial'].copy()
     coordinatesB = nx.from_numpy(coordinatesB)
-    
-    if isinstance(nx,ot.backend.TorchBackend):
-        coordinatesA = coordinatesA.float()
-        coordinatesB = coordinatesB.float()
-    D_A = ot.dist(coordinatesA,coordinatesA, metric='euclidean')
-    D_B = ot.dist(coordinatesB,coordinatesB, metric='euclidean')
 
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        D_A = D_A.cuda()
-        D_B = D_B.cuda()
-    
+    if isinstance(nx, ot.backend.TorchBackend):
+        coordinatesA = _to_device(coordinatesA.float())
+        coordinatesB = _to_device(coordinatesB.float())
+
+    D_A = _to_device(ot.dist(coordinatesA, coordinatesA, metric='euclidean'))
+    D_B = _to_device(ot.dist(coordinatesB, coordinatesB, metric='euclidean'))
+
     # Calculate expression dissimilarity
-    A_X, B_X = nx.from_numpy(to_dense_array(extract_data_matrix(sliceA,use_rep))), nx.from_numpy(to_dense_array(extract_data_matrix(sliceB,use_rep)))
+    A_X = _to_device(nx.from_numpy(to_dense_array(extract_data_matrix(sliceA, use_rep))))
+    B_X = _to_device(nx.from_numpy(to_dense_array(extract_data_matrix(sliceB, use_rep))))
 
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        A_X = A_X.cuda()
-        B_X = B_X.cuda()
+    if isinstance(nx, ot.backend.TorchBackend):
+        A_X = A_X.float()
+        B_X = B_X.float()
 
-    if dissimilarity.lower()=='euclidean' or dissimilarity.lower()=='euc':
-        M = ot.dist(A_X,B_X)
+    if dissimilarity.lower() == 'euclidean' or dissimilarity.lower() == 'euc':
+        M = _to_device(ot.dist(A_X, B_X))
     else:
         s_A = A_X + 0.01
         s_B = B_X + 0.01
-        M = kl_divergence_backend(s_A, s_B)
-        M = nx.from_numpy(M)
-    
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        M = M.cuda()
-    
+        M = _to_device(nx.from_numpy(kl_divergence_backend(s_A, s_B)))
+
     # init distributions
     if a_distribution is None:
-        a = nx.ones((sliceA.shape[0],))/sliceA.shape[0]
+        a = _to_device(nx.ones((sliceA.shape[0],)) / sliceA.shape[0])
     else:
-        a = nx.from_numpy(a_distribution)
-        
-    if b_distribution is None:
-        b = nx.ones((sliceB.shape[0],))/sliceB.shape[0]
-    else:
-        b = nx.from_numpy(b_distribution)
+        a = _to_device(nx.from_numpy(a_distribution))
 
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        a = a.cuda()
-        b = b.cuda()
-    
+    if b_distribution is None:
+        b = _to_device(nx.ones((sliceB.shape[0],)) / sliceB.shape[0])
+    else:
+        b = _to_device(nx.from_numpy(b_distribution))
+
     if norm:
-        D_A /= nx.min(D_A[D_A>0])
-        D_B /= nx.min(D_B[D_B>0])
-    
+        D_A /= nx.min(D_A[D_A > 0])
+        D_B /= nx.min(D_B[D_B > 0])
+
     # Run OT
     if G_init is not None:
         G_init = nx.from_numpy(G_init)
-        if isinstance(nx,ot.backend.TorchBackend):
-            G_init = G_init.float()
-            if use_gpu:
-                G_init.cuda()
-    pi, logw = my_fused_gromov_wasserstein(M, D_A, D_B, a, b, G_init = G_init, loss_fun='square_loss', alpha= alpha, log=True, numItermax=numItermax,verbose=verbose, use_gpu = use_gpu)
+        if isinstance(nx, ot.backend.TorchBackend):
+            G_init = _to_device(G_init.float())
+
+    pi, logw = my_fused_gromov_wasserstein(M, D_A, D_B, a, b, G_init=G_init, loss_fun='square_loss', alpha=alpha, log=True, numItermax=numItermax, verbose=verbose, use_gpu=use_gpu)
     pi = nx.to_numpy(pi)
     obj = nx.to_numpy(logw['fgw_dist'])
-    if isinstance(backend,ot.backend.TorchBackend) and use_gpu:
+
+    if isinstance(backend, ot.backend.TorchBackend) and use_gpu:
+        import torch
         torch.cuda.empty_cache()
 
     if return_obj:
@@ -316,54 +317,81 @@ def center_NMF(W, H, slices, pis, lmbda, n_components, random_seed, dissimilarit
     H_new = model.components_
     return W_new, H_new
 
-def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init = None, loss_fun='square_loss', alpha=0.5, armijo=False, log=False,numItermax=200, tol_rel=1e-9, tol_abs=1e-9, use_gpu = False, **kwargs):
+def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init=None, loss_fun='square_loss', alpha=0.5, armijo=False, log=False, numItermax=200, tol_rel=1e-9, tol_abs=1e-9, use_gpu=False, **kwargs):
     """
     Adapted fused_gromov_wasserstein with the added capability of defining a G_init (inital mapping).
     Also added capability of utilizing different POT backends to speed up computation.
-    
+
     For more info, see: https://pythonot.github.io/gen_modules/ot.gromov.html
     """
 
+    # ------------------------------------------------------------------ #
+    # Step 1: Resolve compute device up front so every tensor is placed   #
+    # on the GPU immediately after creation.                              #
+    # ------------------------------------------------------------------ #
+    device = None
+    if use_gpu:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            else:
+                use_gpu = False
+        except ImportError:
+            use_gpu = False
+
+    def _to_device(t):
+        if device is not None and hasattr(t, "to"):
+            return t.to(device)
+        return t
+
     p, q = ot.utils.list_to_array(p, q)
+
+    # Move all input tensors to device before any computation
+    p  = _to_device(p)
+    q  = _to_device(q)
+    M  = _to_device(M)
+    C1 = _to_device(C1)
+    C2 = _to_device(C2)
 
     p0, q0, C10, C20, M0 = p, q, C1, C2, M
     nx = ot.backend.get_backend(p0, q0, C10, C20, M0)
 
     constC, hC1, hC2 = ot.gromov.init_matrix(C1, C2, p, q, loss_fun)
 
+    # Move auxiliary matrices produced by init_matrix to device
+    constC = _to_device(constC)
+    hC1    = _to_device(hC1)
+    hC2    = _to_device(hC2)
+
     if G_init is None:
-        G0 = p[:, None] * q[None, :]
+        G0 = _to_device(p[:, None] * q[None, :])
     else:
-        G0 = (1/nx.sum(G_init)) * G_init
-        if use_gpu:
-            G0 = G0.cuda()
+        G0 = _to_device((1 / nx.sum(G_init)) * G_init)
 
     def f(G):
         return ot.gromov.gwloss(constC, hC1, hC2, G)
 
     def df(G):
         return ot.gromov.gwggrad(constC, hC1, hC2, G)
-    
+
     if loss_fun == 'kl_loss':
-        armijo = True  # there is no closed form line-search with KL
+        armijo = True  # no closed-form line-search with KL
 
     if armijo:
-        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
             return ot.optim.line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
     else:
-        def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
+        def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
             return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=0., reg=1., nx=nx, **kwargs)
 
     if log:
         res, log = ot.optim.cg(p, q, (1 - alpha) * M, alpha, f, df, G0, line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
-
         fgw_dist = log['loss'][-1]
-
         log['fgw_dist'] = fgw_dist
         log['u'] = log['u']
         log['v'] = log['v']
         return res, log
-
     else:
         return ot.optim.cg(p, q, (1 - alpha) * M, alpha, f, df, G0, line_search, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
 
