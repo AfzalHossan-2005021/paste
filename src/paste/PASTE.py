@@ -15,7 +15,7 @@ def pairwise_align(
     a_distribution = None,
     b_distribution = None,
     norm: bool = False,
-    numItermax: int = 200,
+    numItermax: int = 10000,
     backend = ot.backend.NumpyBackend(),
     use_gpu: bool = False,
     return_obj: bool = False,
@@ -97,32 +97,30 @@ def pairwise_align(
     nx = backend
 
     # Calculate spatial distances
-    coordinatesA = sliceA.obsm['spatial'].copy()
-    coordinatesA = nx.from_numpy(coordinatesA)
-    coordinatesB = sliceB.obsm['spatial'].copy()
-    coordinatesB = nx.from_numpy(coordinatesB)
-
-    if isinstance(nx, ot.backend.TorchBackend):
-        coordinatesA = _to_device(coordinatesA.float())
-        coordinatesB = _to_device(coordinatesB.float())
+    # Cast to float32 on CPU before transfer to halve host→device bandwidth.
+    coordinatesA = nx.from_numpy(sliceA.obsm['spatial'].astype(np.float32))
+    coordinatesB = nx.from_numpy(sliceB.obsm['spatial'].astype(np.float32))
+    coordinatesA = _to_device(coordinatesA)
+    coordinatesB = _to_device(coordinatesB)
 
     D_A = _to_device(ot.dist(coordinatesA, coordinatesA, metric='euclidean'))
     D_B = _to_device(ot.dist(coordinatesB, coordinatesB, metric='euclidean'))
 
     # Calculate expression dissimilarity
-    A_X = _to_device(nx.from_numpy(to_dense_array(extract_data_matrix(sliceA, use_rep))))
-    B_X = _to_device(nx.from_numpy(to_dense_array(extract_data_matrix(sliceB, use_rep))))
-
-    if isinstance(nx, ot.backend.TorchBackend):
-        A_X = A_X.float()
-        B_X = B_X.float()
+    # to_dense_array on CPU is unavoidable for sparse inputs, but we cast to
+    # float32 before the GPU transfer to halve the host→device bandwidth.
+    A_X_np = to_dense_array(extract_data_matrix(sliceA, use_rep)).astype(np.float32)
+    B_X_np = to_dense_array(extract_data_matrix(sliceB, use_rep)).astype(np.float32)
+    A_X = _to_device(nx.from_numpy(A_X_np))
+    B_X = _to_device(nx.from_numpy(B_X_np))
 
     if dissimilarity.lower() == 'euclidean' or dissimilarity.lower() == 'euc':
         M = _to_device(ot.dist(A_X, B_X))
     else:
         s_A = A_X + 0.01
         s_B = B_X + 0.01
-        M = _to_device(nx.from_numpy(kl_divergence_backend(s_A, s_B)))
+        # kl_divergence_backend now returns a native backend tensor (no numpy round-trip)
+        M = _to_device(kl_divergence_backend(s_A, s_B))
 
     # init distributions
     if a_distribution is None:
@@ -248,7 +246,7 @@ def center_align(
     
     if pis_init is None:
         pis = [None for i in range(len(slices))]
-        W = model.fit_transform(A.X)
+        W = model.fit_transform(to_dense_array(A.X))
     else:
         pis = pis_init
         W = model.fit_transform(A.shape[0]*sum([lmbda[i]*np.dot(pis[i], to_dense_array(slices[i].X)) for i in range(len(slices))]))

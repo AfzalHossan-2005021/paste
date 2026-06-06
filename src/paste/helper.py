@@ -94,7 +94,7 @@ def kl_divergence_backend(X, Y):
     X_log_X = nx.einsum('ij,ij->i',X,log_X)
     X_log_X = nx.reshape(X_log_X,(1,X_log_X.shape[0]))
     D = X_log_X.T - nx.dot(X,log_Y.T)
-    return nx.to_numpy(D)
+    return D
 
 
 def intersect(lst1, lst2):
