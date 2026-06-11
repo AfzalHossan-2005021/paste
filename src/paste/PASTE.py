@@ -181,6 +181,12 @@ def pairwise_align(
     )
     pi  = nx.to_numpy(pi)
     obj = nx.to_numpy(logw['fgw_dist'])
+    pi_mean = pi.mean()
+    pi_max  = pi.max()
+    uniform_val = 1.0 / (pi.shape[0] * pi.shape[1])
+    print(f"[pairwise_align] pi shape={pi.shape}  mean={pi_mean:.3e}  max={pi_max:.3e}  "
+          f"uniform_val={uniform_val:.3e}  max/uniform={pi_max/uniform_val:.2f}x  "
+          f"fgw_obj={float(obj):.6f}  iters={len(logw['loss'])-1}")
 
     if isinstance(backend, ot.backend.TorchBackend) and use_gpu:
         import torch
@@ -441,7 +447,7 @@ def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init=None, loss_fun='square_l
             return ot.optim.line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
     else:
         def line_search(cost, G, deltaG, Mi, cost_G, df_G, **kwargs):
-            return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=0., reg=1., nx=nx, **kwargs)
+            return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=(1 - alpha) * M, reg=alpha, nx=nx, **kwargs)
 
     if log:
         res, log = ot.optim.cg(p, q, (1 - alpha) * M, alpha, f, df, G0, line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
