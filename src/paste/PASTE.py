@@ -14,10 +14,10 @@ def pairwise_align(
     G_init = None,
     a_distribution = None,
     b_distribution = None,
-    norm: bool = False,
-    numItermax: int = 10000,
-    backend = ot.backend.NumpyBackend(),
-    use_gpu: bool = False,
+    norm: bool = True,
+    numItermax: int = 200,
+    backend = ot.backend.TorchBackend(),
+    use_gpu: bool = True,
     return_obj: bool = False,
     verbose: bool = False,
     gpu_verbose: bool = True,
@@ -203,24 +203,23 @@ def center_align(
     if use_gpu:
         try:
             import torch
-        except:
-             print("We currently only have gpu support for Pytorch. Please install torch.")
-                
-        if isinstance(backend,ot.backend.TorchBackend):
-            if torch.cuda.is_available():
+            if not isinstance(backend, ot.backend.TorchBackend):
+                print("We currently only have gpu support for Pytorch, please set backend = ot.backend.TorchBackend(). Reverting to selected backend cpu.")
+                use_gpu = False
+            elif torch.cuda.is_available():
                 if gpu_verbose:
                     print("gpu is available, using gpu.")
             else:
                 if gpu_verbose:
                     print("gpu is not available, resorting to torch cpu.")
                 use_gpu = False
-        else:
-            print("We currently only have gpu support for Pytorch, please set backend = ot.backend.TorchBackend(). Reverting to selected backend cpu.")
+        except ImportError:
+            print("We currently only have gpu support for Pytorch. Please install torch.")
             use_gpu = False
     else:
         if gpu_verbose:
             print("Using selected backend cpu. If you want to use gpu, set use_gpu = True.")
-    
+
     if lmbda is None:
         lmbda = len(slices)*[1/len(slices)]
     
@@ -238,18 +237,22 @@ def center_align(
         slices[i] = slices[i][:, common_genes]
     print('Filtered all slices for common genes. There are ' + str(len(common_genes)) + ' common genes.')
 
+    # Densify slice expression matrices once — avoids repeated .toarray() inside
+    # center_NMF and the final full_rank computation (called every outer iteration).
+    slices_X = [to_dense_array(s.X) for s in slices]
+
     # Run initial NMF
     if dissimilarity.lower()=='euclidean' or dissimilarity.lower()=='euc':
         model = NMF(n_components=n_components, init='random', random_state = random_seed, verbose = verbose)
     else:
         model = NMF(n_components=n_components, solver = 'mu', beta_loss = 'kullback-leibler', init='random', random_state = random_seed, verbose = verbose)
-    
+
     if pis_init is None:
         pis = [None for i in range(len(slices))]
         W = model.fit_transform(to_dense_array(A.X))
     else:
         pis = pis_init
-        W = model.fit_transform(A.shape[0]*sum([lmbda[i]*np.dot(pis[i], to_dense_array(slices[i].X)) for i in range(len(slices))]))
+        W = model.fit_transform(A.shape[0]*sum([lmbda[i]*np.dot(pis[i], slices_X[i]) for i in range(len(slices))]))
     H = model.components_
     center_coordinates = A.obsm['spatial']
     
@@ -268,19 +271,20 @@ def center_align(
     R_diff = 100
     while R_diff > threshold and iteration_count < max_iter:
         print("Iteration: " + str(iteration_count))
-        pis, r = center_ot(W, H, slices, center_coordinates, common_genes, alpha, backend, use_gpu, dissimilarity = dissimilarity, norm = norm, G_inits = pis, distributions=distributions, verbose = verbose)
-        W, H = center_NMF(W, H, slices, pis, lmbda, n_components, random_seed, dissimilarity = dissimilarity, verbose = verbose)
-        R_new = np.dot(r,lmbda)
+        pis, r = center_ot(W, H, slices, center_coordinates, common_genes, alpha, backend, use_gpu, dissimilarity=dissimilarity, norm=norm, G_inits=pis, distributions=distributions, verbose=verbose)
+        W, H = center_NMF(W, H, slices_X, pis, lmbda, n_components, random_seed, dissimilarity=dissimilarity, verbose=verbose)
+        R_new = np.dot(r, lmbda)
         iteration_count += 1
         R_diff = abs(R - R_new)
-        print("Objective ",R_new)
+        print("Objective ", R_new)
         print("Difference: " + str(R_diff) + "\n")
         R = R_new
     center_slice = A.copy()
     center_slice.X = np.dot(W, H)
     center_slice.uns['paste_W'] = W
     center_slice.uns['paste_H'] = H
-    center_slice.uns['full_rank'] = center_slice.shape[0]*sum([lmbda[i]*np.dot(pis[i], to_dense_array(slices[i].X)) for i in range(len(slices))])
+    # slices_X already dense — no repeated .toarray() here
+    center_slice.uns['full_rank'] = center_slice.shape[0]*sum([lmbda[i]*np.dot(pis[i], slices_X[i]) for i in range(len(slices))])
     center_slice.uns['obj'] = R
     return center_slice, pis
 
@@ -303,10 +307,11 @@ def center_ot(W, H, slices, center_coordinates, common_genes, alpha, backend, us
         r.append(r_q)
     return pis, np.array(r)
 
-def center_NMF(W, H, slices, pis, lmbda, n_components, random_seed, dissimilarity = 'kl', verbose = False):
+def center_NMF(W, H, slices_X, pis, lmbda, n_components, random_seed, dissimilarity = 'kl', verbose = False):
     print('Solving Center Mapping NMF Problem.')
     n = W.shape[0]
-    B = n*sum([lmbda[i]*np.dot(pis[i], to_dense_array(slices[i].X)) for i in range(len(slices))])
+    # slices_X is a list of pre-densified numpy arrays — no repeated .toarray() per iteration
+    B = n*sum([lmbda[i]*np.dot(pis[i], slices_X[i]) for i in range(len(slices_X))])
     if dissimilarity.lower()=='euclidean' or dissimilarity.lower()=='euc':
         model = NMF(n_components=n_components, init='random', random_state = random_seed, verbose = verbose)
     else:
@@ -446,9 +451,10 @@ def solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M, reg,
         else:
             nx = ot.backend.get_backend(G, deltaG, C1, C2, M)
 
-    dot = nx.dot(nx.dot(C1, deltaG), C2.T)
-    a = -2 * reg * nx.sum(dot * deltaG)
-    b = nx.sum(M * deltaG) - 2 * reg * (nx.sum(dot * G) + nx.sum(nx.dot(nx.dot(C1, G), C2.T) * deltaG))
+    dot_deltaG = nx.dot(nx.dot(C1, deltaG), C2.T)
+    dot_G      = nx.dot(nx.dot(C1, G),      C2.T)
+    a = -2 * reg * nx.sum(dot_deltaG * deltaG)
+    b = nx.sum(M * deltaG) - 2 * reg * (nx.sum(dot_deltaG * G) + nx.sum(dot_G * deltaG))
 
     alpha = ot.optim.solve_1d_linesearch_quad(a, b)
     if alpha_min is not None or alpha_max is not None:

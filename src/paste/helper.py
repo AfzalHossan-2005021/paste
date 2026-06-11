@@ -89,6 +89,11 @@ def kl_divergence_backend(X, Y):
 
     X = X/nx.sum(X,axis=1, keepdims=True)
     Y = Y/nx.sum(Y,axis=1, keepdims=True)
+    # Clamp before log: float32 normalisation can underflow small values to 0,
+    # producing log(0)=-inf and then 0*-inf=nan in the dot product.
+    eps = 1e-10
+    X = nx.maximum(X, eps)
+    Y = nx.maximum(Y, eps)
     log_X = nx.log(X)
     log_Y = nx.log(Y)
     X_log_X = nx.einsum('ij,ij->i',X,log_X)
