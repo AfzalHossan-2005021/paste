@@ -171,7 +171,7 @@ def pairwise_align(
     pi, logw = my_fused_gromov_wasserstein(
         M, D_A, D_B, a, b,
         G_init=G_init,
-        loss_fun='square_loss',
+        loss_fun='kl_loss',
         alpha=alpha,
         log=True,
         numItermax=numItermax,
