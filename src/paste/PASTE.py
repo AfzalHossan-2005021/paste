@@ -18,6 +18,7 @@ def pairwise_align(
     numItermax: int = 200,
     backend = ot.backend.TorchBackend(),
     use_gpu: bool = True,
+    dtype: str = 'float32',
     return_obj: bool = False,
     verbose: bool = False,
     gpu_verbose: bool = True,
@@ -38,6 +39,11 @@ def pairwise_align(
         norm: If ``True``, scales spatial distances such that neighboring spots are at distance 1. Otherwise, spatial distances remain unchanged.
         backend: Type of backend to run calculations. For list of backends available on system: ``ot.backend.get_backend_list()``.
         use_gpu: If ``True``, use gpu. Otherwise, use cpu. Currently we only have gpu support for Pytorch.
+        dtype: Floating-point precision for all tensors: ``'float32'`` (default, faster, less memory)
+               or ``'float64'`` (higher precision, required by some OT solvers on CPU).
+               Note: ``ot.emd`` on CPU requires float64; when ``use_gpu=False`` and
+               ``dtype='float32'`` the distributions ``a``/``b`` are automatically
+               upcast to float64 before the EMD call inside the FGW solver.
         return_obj: If ``True``, additionally returns objective function output of FGW-OT.
         verbose: If ``True``, FGW-OT is verbose.
         gpu_verbose: If ``True``, print whether gpu is being used to user.
@@ -51,7 +57,29 @@ def pairwise_align(
     """
 
     # ------------------------------------------------------------------ #
-    # Step 1: Resolve compute device up front.                            #
+    # Step 1: Resolve dtype.                                               #
+    # All tensors are cast to this dtype so there are no mixed-precision   #
+    # operations anywhere in the pipeline.                                 #
+    # ------------------------------------------------------------------ #
+    if dtype == 'float32':
+        np_dtype   = np.float32
+        torch_cast = 'float'   # torch.Tensor.float()  → float32
+    elif dtype == 'float64':
+        np_dtype   = np.float64
+        torch_cast = 'double'  # torch.Tensor.double() → float64
+    else:
+        raise ValueError(f"dtype must be 'float32' or 'float64', got '{dtype}'.")
+
+    def _cast(t):
+        """Cast a backend tensor to the requested dtype."""
+        if hasattr(t, torch_cast):          # Torch tensor
+            return getattr(t, torch_cast)()
+        if isinstance(t, np.ndarray):
+            return t.astype(np_dtype)
+        return t
+
+    # ------------------------------------------------------------------ #
+    # Step 2: Resolve compute device up front.                            #
     # Every tensor created below is immediately placed on `device` so     #
     # the GPU is utilised from the first allocation onward.               #
     # ------------------------------------------------------------------ #
@@ -78,10 +106,14 @@ def pairwise_align(
             print("Using selected backend cpu. If you want to use gpu, set use_gpu = True.")
 
     def _to_device(t):
-        """Move a Torch tensor to the resolved device (no-op for numpy arrays)."""
+        """Move a tensor to the resolved device (no-op for numpy / CPU path)."""
         if device is not None and hasattr(t, "to"):
             return t.to(device)
         return t
+
+    def _prepare(t):
+        """Cast to the requested dtype then move to device — single call per tensor."""
+        return _to_device(_cast(t))
 
     # subset for common genes
     common_genes = intersect(sliceA.var.index, sliceB.var.index)
@@ -96,55 +128,58 @@ def pairwise_align(
     # Backend
     nx = backend
 
-    # Calculate spatial distances
-    # Cast to float32 on CPU before transfer to halve host→device bandwidth.
-    coordinatesA = nx.from_numpy(sliceA.obsm['spatial'].astype(np.float32))
-    coordinatesB = nx.from_numpy(sliceB.obsm['spatial'].astype(np.float32))
-    coordinatesA = _to_device(coordinatesA)
-    coordinatesB = _to_device(coordinatesB)
+    # ------------------------------------------------------------------ #
+    # Step 3: Build all tensors with consistent dtype from the start.     #
+    # ------------------------------------------------------------------ #
 
-    D_A = _to_device(ot.dist(coordinatesA, coordinatesA, metric='euclidean'))
-    D_B = _to_device(ot.dist(coordinatesB, coordinatesB, metric='euclidean'))
+    # Spatial distance matrices
+    coordinatesA = _prepare(nx.from_numpy(sliceA.obsm['spatial'].astype(np_dtype)))
+    coordinatesB = _prepare(nx.from_numpy(sliceB.obsm['spatial'].astype(np_dtype)))
+    D_A = _prepare(ot.dist(coordinatesA, coordinatesA, metric='euclidean'))
+    D_B = _prepare(ot.dist(coordinatesB, coordinatesB, metric='euclidean'))
 
-    # Calculate expression dissimilarity
-    # to_dense_array on CPU is unavoidable for sparse inputs, but we cast to
-    # float32 before the GPU transfer to halve the host→device bandwidth.
-    A_X_np = to_dense_array(extract_data_matrix(sliceA, use_rep)).astype(np.float32)
-    B_X_np = to_dense_array(extract_data_matrix(sliceB, use_rep)).astype(np.float32)
-    A_X = _to_device(nx.from_numpy(A_X_np))
-    B_X = _to_device(nx.from_numpy(B_X_np))
+    # Expression matrices
+    A_X = _prepare(nx.from_numpy(to_dense_array(extract_data_matrix(sliceA, use_rep)).astype(np_dtype)))
+    B_X = _prepare(nx.from_numpy(to_dense_array(extract_data_matrix(sliceB, use_rep)).astype(np_dtype)))
 
+    # Cost matrix M
     if dissimilarity.lower() == 'euclidean' or dissimilarity.lower() == 'euc':
-        M = _to_device(ot.dist(A_X, B_X))
+        M = _prepare(ot.dist(A_X, B_X))
     else:
-        s_A = A_X + 0.01
-        s_B = B_X + 0.01
-        # kl_divergence_backend now returns a native backend tensor (no numpy round-trip)
-        M = _to_device(kl_divergence_backend(s_A, s_B))
+        M = _prepare(kl_divergence_backend(A_X + 0.01, B_X + 0.01))
 
-    # init distributions
+    # Marginal distributions
     if a_distribution is None:
-        a = _to_device(nx.ones((sliceA.shape[0],)) / sliceA.shape[0])
+        a = _prepare(nx.ones((sliceA.shape[0],)) / sliceA.shape[0])
     else:
-        a = _to_device(nx.from_numpy(a_distribution))
+        a = _prepare(nx.from_numpy(np.asarray(a_distribution)))
 
     if b_distribution is None:
-        b = _to_device(nx.ones((sliceB.shape[0],)) / sliceB.shape[0])
+        b = _prepare(nx.ones((sliceB.shape[0],)) / sliceB.shape[0])
     else:
-        b = _to_device(nx.from_numpy(b_distribution))
+        b = _prepare(nx.from_numpy(np.asarray(b_distribution)))
 
+    # Normalise spatial distances so nearest-neighbour distance == 1
     if norm:
         D_A /= nx.min(D_A[D_A > 0])
         D_B /= nx.min(D_B[D_B > 0])
 
-    # Run OT
+    # Initial transport plan (optional)
     if G_init is not None:
-        G_init = nx.from_numpy(G_init)
-        if isinstance(nx, ot.backend.TorchBackend):
-            G_init = _to_device(G_init.float())
+        G_init = _prepare(nx.from_numpy(np.asarray(G_init, dtype=np_dtype)))
 
-    pi, logw = my_fused_gromov_wasserstein(M, D_A, D_B, a, b, G_init=G_init, loss_fun='square_loss', alpha=alpha, log=True, numItermax=numItermax, verbose=verbose, use_gpu=use_gpu)
-    pi = nx.to_numpy(pi)
+    pi, logw = my_fused_gromov_wasserstein(
+        M, D_A, D_B, a, b,
+        G_init=G_init,
+        loss_fun='square_loss',
+        alpha=alpha,
+        log=True,
+        numItermax=numItermax,
+        verbose=verbose,
+        use_gpu=use_gpu,
+        dtype=dtype,
+    )
+    pi  = nx.to_numpy(pi)
     obj = nx.to_numpy(logw['fgw_dist'])
 
     if isinstance(backend, ot.backend.TorchBackend) and use_gpu:
@@ -320,7 +355,7 @@ def center_NMF(W, H, slices_X, pis, lmbda, n_components, random_seed, dissimilar
     H_new = model.components_
     return W_new, H_new
 
-def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init=None, loss_fun='square_loss', alpha=0.5, armijo=False, log=False, numItermax=200, tol_rel=1e-9, tol_abs=1e-9, use_gpu=False, **kwargs):
+def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init=None, loss_fun='square_loss', alpha=0.5, armijo=False, log=False, numItermax=200, tol_rel=1e-9, tol_abs=1e-9, use_gpu=False, dtype='float32', **kwargs):
     """
     Adapted fused_gromov_wasserstein with the added capability of defining a G_init (inital mapping).
     Also added capability of utilizing different POT backends to speed up computation.
@@ -329,7 +364,17 @@ def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init=None, loss_fun='square_l
     """
 
     # ------------------------------------------------------------------ #
-    # Step 1: Resolve compute device up front so every tensor is placed   #
+    # Step 1: Resolve dtype so every tensor in this function is uniform.  #
+    # ------------------------------------------------------------------ #
+    if dtype == 'float32':
+        np_dtype   = np.float32
+        torch_cast = 'float'
+    else:
+        np_dtype   = np.float64
+        torch_cast = 'double'
+
+    # ------------------------------------------------------------------ #
+    # Step 2: Resolve compute device up front so every tensor is placed   #
     # on the GPU immediately after creation.                              #
     # ------------------------------------------------------------------ #
     device = None
@@ -343,34 +388,44 @@ def my_fused_gromov_wasserstein(M, C1, C2, p, q, G_init=None, loss_fun='square_l
         except ImportError:
             use_gpu = False
 
+    def _cast(t):
+        if hasattr(t, torch_cast):
+            return getattr(t, torch_cast)()
+        if isinstance(t, np.ndarray):
+            return t.astype(np_dtype)
+        return t
+
     def _to_device(t):
         if device is not None and hasattr(t, "to"):
             return t.to(device)
         return t
 
+    def _prepare(t):
+        return _to_device(_cast(t))
+
     p, q = ot.utils.list_to_array(p, q)
 
-    # Move all input tensors to device before any computation
-    p  = _to_device(p)
-    q  = _to_device(q)
-    M  = _to_device(M)
-    C1 = _to_device(C1)
-    C2 = _to_device(C2)
+    # Cast and move all input tensors to device before any computation
+    p  = _prepare(p)
+    q  = _prepare(q)
+    M  = _prepare(M)
+    C1 = _prepare(C1)
+    C2 = _prepare(C2)
 
     p0, q0, C10, C20, M0 = p, q, C1, C2, M
     nx = ot.backend.get_backend(p0, q0, C10, C20, M0)
 
     constC, hC1, hC2 = ot.gromov.init_matrix(C1, C2, p, q, loss_fun)
 
-    # Move auxiliary matrices produced by init_matrix to device
-    constC = _to_device(constC)
-    hC1    = _to_device(hC1)
-    hC2    = _to_device(hC2)
+    # Cast and move auxiliary matrices produced by init_matrix
+    constC = _prepare(constC)
+    hC1    = _prepare(hC1)
+    hC2    = _prepare(hC2)
 
     if G_init is None:
-        G0 = _to_device(p[:, None] * q[None, :])
+        G0 = _prepare(p[:, None] * q[None, :])
     else:
-        G0 = _to_device((1 / nx.sum(G_init)) * G_init)
+        G0 = _prepare((1 / nx.sum(G_init)) * G_init)
 
     def f(G):
         return ot.gromov.gwloss(constC, hC1, hC2, G)
